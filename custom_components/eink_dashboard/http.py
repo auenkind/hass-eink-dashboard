@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Authenticated layout API and public image HTTP views."""
+"""Authenticated layout API and public PNG/BMP image HTTP views."""
 
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
 
 from .battery import build_entity_state, resolve_battery_level
+from .bmp import BmpDepth
 from .const import (
     DEFAULT_HEIGHT,
     DEFAULT_WIDTH,
@@ -31,6 +33,9 @@ from .const import (
     resolve_device_preset,
 )
 from .data import get_loaded_entry
+
+if TYPE_CHECKING:
+    from .data import EinkDashboardConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -155,58 +160,128 @@ class EinkPublicImageView(HomeAssistantView):
 
     async def get(self, request: web.Request, entry_id: str) -> web.Response:
         """Serve the latest rendered PNG, honouring If-None-Match."""
-        hass = request.app["hass"]
-        entry = get_loaded_entry(hass, entry_id)
-        if entry is None:
-            raise web.HTTPNotFound()
+        return await _serve_image(request, entry_id, bmp_depth=None)
 
-        entity = entry.runtime_data.entity
-        if entity is None:
-            raise web.HTTPServiceUnavailable()
+
+class EinkPublicBmpImageView(HomeAssistantView):
+    """Unauthenticated view serving the rendered image as an uncompressed BMP.
+
+    Intended for microcontrollers (e.g. ESP8266 with ESPHome's
+    ``online_image``) that do not have enough RAM to decode PNG. The
+    optional ``bits`` query parameter selects the bit depth: ``1``
+    forces 1-bit black/white, ``8`` forces 8-bit grayscale, and the
+    default picks 1-bit whenever the image is pure black and white.
+    """
+
+    url = "/api/eink_dashboard/{entry_id}/image.bmp"
+    name = "api:eink_dashboard:image_bmp"
+    requires_auth = False
+
+    async def get(self, request: web.Request, entry_id: str) -> web.Response:
+        """Serve the latest rendered image as BMP, honouring If-None-Match."""
+        bits = request.query.get("bits", BmpDepth.AUTO.value)
+        try:
+            depth = BmpDepth(bits)
+        except ValueError:
+            raise web.HTTPBadRequest(
+                text="bits must be one of: auto, 1, 8"
+            ) from None
+        return await _serve_image(request, entry_id, bmp_depth=depth)
+
+
+def _update_battery_from_query(
+    request: web.Request, entry: EinkDashboardConfigEntry
+) -> None:
+    """Forward ``batteryLevel``/``isCharging`` query params to the sensor.
+
+    Args:
+        request: The incoming image request.
+        entry: The loaded config entry owning the battery sensor.
+    """
+    battery_str = request.query.get("batteryLevel")
+    if battery_str is None:
+        return
+    try:
+        level = max(0, min(100, int(float(battery_str))))
+    except (ValueError, TypeError):
+        return
+    sensor = entry.runtime_data.battery_sensor
+    if sensor is None:
+        return
+    is_charging = request.query.get("isCharging") == "1"
+    sensor.update_battery(level, is_charging)
+    _LOGGER.info(
+        "E-Ink device request: battery=%d%%, charging=%s",
+        level,
+        is_charging,
+    )
+
+
+async def _serve_image(
+    request: web.Request,
+    entry_id: str,
+    *,
+    bmp_depth: BmpDepth | None,
+) -> web.Response:
+    """Serve the latest rendered image as PNG or BMP with ETag/304 support.
+
+    Args:
+        request: The incoming image request.
+        entry_id: Config entry ID taken from the URL.
+        bmp_depth: BMP bit depth to convert to, or None to serve the
+            rendered PNG unchanged.
+
+    Returns:
+        A 200 response with the image body, or a 304 when the client's
+        If-None-Match matches the current ETag.
+
+    Raises:
+        HTTPNotFound: The entry ID is unknown or not loaded.
+        HTTPServiceUnavailable: No image has been rendered yet.
+    """
+    hass = request.app["hass"]
+    entry = get_loaded_entry(hass, entry_id)
+    if entry is None:
+        raise web.HTTPNotFound()
+
+    entity = entry.runtime_data.entity
+    if entity is None:
+        raise web.HTTPServiceUnavailable()
+    if bmp_depth is None:
         image_bytes = await entity.async_image()
-        if image_bytes is None:
-            raise web.HTTPServiceUnavailable()
+    else:
+        image_bytes = await entity.async_image_bmp(bmp_depth)
+    if image_bytes is None:
+        raise web.HTTPServiceUnavailable()
 
-        # Battery arrives on every poll, even when returning 304.
-        battery_str = request.query.get("batteryLevel")
-        if battery_str is not None:
-            try:
-                level = max(0, min(100, int(float(battery_str))))
-            except (ValueError, TypeError):
-                level = None
-            if level is not None:
-                sensor = entry.runtime_data.battery_sensor
-                if sensor is not None:
-                    is_charging = request.query.get("isCharging") == "1"
-                    sensor.update_battery(level, is_charging)
-                    _LOGGER.info(
-                        "E-Ink device request: battery=%d%%, charging=%s",
-                        level,
-                        is_charging,
-                    )
+    # Battery arrives on every poll, even when returning 304.
+    _update_battery_from_query(request, entry)
 
-        etag = entity.etag
+    etag = entity.etag
+    if etag is not None and bmp_depth is not None:
+        # Distinct validator per representation: the BMP is derived
+        # deterministically from the PNG, so it changes exactly when
+        # the PNG's hash does.
+        etag = f'{etag[:-1]}-bmp{bmp_depth.value}"'
 
-        if_none_match = request.headers.get("If-None-Match")
-        if (
-            etag is not None
-            and if_none_match is not None
-            and if_none_match in ("*", etag)
-        ):
-            _LOGGER.info("ETag hit (%s), returning 304", etag)
-            resp = web.Response(status=304)
-            resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = "no-cache"
-            return resp
+    if_none_match = request.headers.get("If-None-Match")
+    if (
+        etag is not None
+        and if_none_match is not None
+        and if_none_match in ("*", etag)
+    ):
+        _LOGGER.info("ETag hit (%s), returning 304", etag)
+        resp = web.Response(status=304)
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
-        _LOGGER.info(
-            "Serving image: %d bytes, etag=%s", len(image_bytes), etag
-        )
-        response = web.Response(
-            body=image_bytes,
-            content_type="image/png",
-        )
-        response.headers["Cache-Control"] = "no-cache"
-        if etag is not None:
-            response.headers["ETag"] = etag
-        return response
+    _LOGGER.info("Serving image: %d bytes, etag=%s", len(image_bytes), etag)
+    response = web.Response(
+        body=image_bytes,
+        content_type="image/png" if bmp_depth is None else "image/bmp",
+    )
+    response.headers["Cache-Control"] = "no-cache"
+    if etag is not None:
+        response.headers["ETag"] = etag
+    return response

@@ -76,7 +76,11 @@ from .data import (
     EinkDashboardRuntimeData,
     get_loaded_entry,
 )
-from .http import EinkLayoutView, EinkPublicImageView
+from .http import (
+    EinkLayoutView,
+    EinkPublicBmpImageView,
+    EinkPublicImageView,
+)
 from .store import EinkDashboardStore
 from .svg_render import render_widget_svg
 from .widgets.week_calendar import week_calendar_entity_ids
@@ -1093,6 +1097,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     _LOGGER.debug("async_setup: registering HTTP views and static paths")
 
     hass.http.register_view(EinkPublicImageView())
+    hass.http.register_view(EinkPublicBmpImageView())
     hass.http.register_view(EinkLayoutView())
     await hass.http.async_register_static_paths(
         [

@@ -266,6 +266,39 @@ See [Setting up OpenDisplay for image push](docs/opendisplay.md) for the
 full automation, including how to detect when a battery-powered display
 wakes up so the push arrives while it's reachable.
 
+### ESPHome and other microcontrollers (BMP)
+
+Small microcontrollers such as the ESP8266 cannot decode PNG: the decoder
+needs a contiguous block of up to 32 KB of RAM for its zlib window. For
+these devices the same image is also served as an uncompressed BMP:
+
+```
+http://<ha-ip>:8123/api/eink_dashboard/<entry_id>/image.bmp
+```
+
+With **2 gray levels** the rendered image is pure black and white and is
+delivered as a 1-bit BMP (about 5 KB for 296x128). Images with gray levels
+are delivered as 8-bit grayscale. Append `?bits=1` to always get a 1-bit
+BMP (gray pixels are thresholded, no dithering) or `?bits=8` to always get
+8-bit grayscale. ETags, `304 Not Modified` and the `batteryLevel` /
+`isCharging` query parameters work exactly like on the PNG endpoint. Like
+`image.png`, this endpoint requires no authentication.
+
+Example with ESPHome's
+[`online_image`](https://esphome.io/components/online_image.html):
+
+```yaml
+online_image:
+  - id: dashboard_img
+    url: "http://<ha-ip>:8123/api/eink_dashboard/<entry_id>/image.bmp?bits=1"
+    format: BMP
+    type: BINARY
+    buffer_size: 8192
+    update_interval: 5min
+    on_download_finished:
+      - component.update: epaper
+```
+
 ## License
 
 Apache 2.0 -- see [LICENSE](LICENSE).

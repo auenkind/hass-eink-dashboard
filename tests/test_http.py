@@ -15,16 +15,20 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import struct
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant.components.frontend import (
     DATA_EXTRA_MODULE_URL,
     UrlManager,
 )
 from homeassistant.setup import async_setup_component
+from PIL import Image
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.eink_dashboard.bmp import png_to_bmp
 from custom_components.eink_dashboard.const import (
     DEFAULT_HEIGHT,
     DEFAULT_WIDTH,
@@ -33,6 +37,7 @@ from custom_components.eink_dashboard.const import (
 )
 from custom_components.eink_dashboard.http import (
     EinkLayoutView,
+    EinkPublicBmpImageView,
     EinkPublicImageView,
 )
 
@@ -56,6 +61,19 @@ _DEFAULT_OPTIONS = {
 
 def _image_url(entry_id: str) -> str:
     return f"/api/eink_dashboard/{entry_id}/image.png"
+
+
+def _bmp_url(entry_id: str) -> str:
+    return f"/api/eink_dashboard/{entry_id}/image.bmp"
+
+
+def _real_png(gray: int = 0) -> bytes:
+    """Return a small real PNG with a black and a ``gray`` half."""
+    img = Image.new("L", (16, 8), 255)
+    img.paste(gray, (0, 0, 8, 8))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _layout_url(entry_id: str) -> str:
@@ -126,6 +144,13 @@ class TestViewAttributes:
         assert "eink_dashboard" in view.url
         assert "image.png" in view.url
         assert view.requires_auth is False
+
+    def test_bmp_view_attributes(self) -> None:
+        # Public BMP view has no auth requirement and its own name.
+        view = EinkPublicBmpImageView()
+        assert "image.bmp" in view.url
+        assert view.requires_auth is False
+        assert view.name != EinkPublicImageView().name
 
     def test_layout_view_attributes(self) -> None:
         # Layout view requires authentication.
@@ -427,6 +452,176 @@ class TestEinkPublicImageView:
 
         assert resp.status == 304
         sensor.update_battery.assert_called_once_with(78, True)
+
+
+class TestEinkPublicBmpImageView:
+    async def test_returns_1bit_bmp(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # A black/white render is served as a 1-bit BMP with an ETag.
+        entry = await _setup_entry(hass)
+        png = _real_png()
+        _seed_rendered(
+            entry.runtime_data.entity,
+            png,
+            f'"{hashlib.sha256(png).hexdigest()}"',
+        )
+
+        client = await hass_client_no_auth()
+        resp = await client.get(_bmp_url(entry.entry_id))
+
+        assert resp.status == 200
+        assert resp.content_type == "image/bmp"
+        body = await resp.read()
+        assert body[:2] == b"BM"
+        assert struct.unpack_from("<H", body, 28)[0] == 1
+        assert resp.headers["Cache-Control"] == "no-cache"
+        assert resp.headers["ETag"].endswith('-bmpauto"')
+
+    async def test_bmp_etag_differs_from_png(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # BMP and PNG representations carry distinct ETags.
+        entry = await _setup_entry(hass)
+        _seed_rendered(entry.runtime_data.entity, _real_png())
+
+        client = await hass_client_no_auth()
+        png_resp = await client.get(_image_url(entry.entry_id))
+        bmp_resp = await client.get(_bmp_url(entry.entry_id))
+
+        assert png_resp.headers["ETag"] != bmp_resp.headers["ETag"]
+
+    async def test_bmp_304_on_matching_etag(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # Re-sending the BMP ETag yields 304 without a body.
+        entry = await _setup_entry(hass)
+        _seed_rendered(entry.runtime_data.entity, _real_png())
+
+        client = await hass_client_no_auth()
+        first = await client.get(_bmp_url(entry.entry_id))
+        etag = first.headers["ETag"]
+        resp = await client.get(
+            _bmp_url(entry.entry_id), headers={"If-None-Match": etag}
+        )
+
+        assert resp.status == 304
+        assert await resp.read() == b""
+        assert resp.headers["ETag"] == etag
+
+    async def test_png_etag_does_not_match_bmp(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # The PNG ETag is not accepted as a validator for the BMP.
+        entry = await _setup_entry(hass)
+        _seed_rendered(entry.runtime_data.entity, _real_png())
+
+        client = await hass_client_no_auth()
+        resp = await client.get(
+            _bmp_url(entry.entry_id),
+            headers={"If-None-Match": PNG_ETAG},
+        )
+
+        assert resp.status == 200
+
+    async def test_bits_param_forces_depth(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # bits=8 and bits=1 override the automatic depth selection.
+        entry = await _setup_entry(hass)
+        _seed_rendered(entry.runtime_data.entity, _real_png(gray=120))
+
+        client = await hass_client_no_auth()
+        auto = await (await client.get(_bmp_url(entry.entry_id))).read()
+        mono_resp = await client.get(
+            _bmp_url(entry.entry_id), params={"bits": "1"}
+        )
+        mono = await mono_resp.read()
+        gray = await (
+            await client.get(_bmp_url(entry.entry_id), params={"bits": "8"})
+        ).read()
+
+        assert struct.unpack_from("<H", auto, 28)[0] == 8
+        assert struct.unpack_from("<H", mono, 28)[0] == 1
+        assert struct.unpack_from("<H", gray, 28)[0] == 8
+        assert mono_resp.headers["ETag"].endswith('-bmp1"')
+
+    async def test_invalid_bits_raises_400(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # An unsupported bits value is rejected.
+        entry = await _setup_entry(hass)
+        _seed_rendered(entry.runtime_data.entity, _real_png())
+
+        client = await hass_client_no_auth()
+        resp = await client.get(_bmp_url(entry.entry_id), params={"bits": "4"})
+
+        assert resp.status == 400
+
+    async def test_bmp_cached_per_render(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # The conversion runs once per rendered image, not per request.
+        entry = await _setup_entry(hass)
+        _seed_rendered(entry.runtime_data.entity, _real_png())
+
+        client = await hass_client_no_auth()
+        with patch(
+            "custom_components.eink_dashboard.image.png_to_bmp",
+            wraps=png_to_bmp,
+        ) as conv:
+            await client.get(_bmp_url(entry.entry_id))
+            await client.get(_bmp_url(entry.entry_id))
+            assert conv.call_count == 1
+
+            new_png = _real_png(gray=255)
+            _seed_rendered(
+                entry.runtime_data.entity,
+                new_png,
+                f'"{hashlib.sha256(new_png).hexdigest()}"',
+            )
+            await client.get(_bmp_url(entry.entry_id))
+            assert conv.call_count == 2
+
+    async def test_bmp_missing_entry_raises_404(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # Unknown entry_id in the BMP URL returns 404.
+        await _setup_entry(hass)
+
+        client = await hass_client_no_auth()
+        resp = await client.get(_bmp_url("nonexistent_entry"))
+
+        assert resp.status == 404
+
+    async def test_bmp_no_image_raises_503(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # No rendered image yet means 503 on the BMP endpoint too.
+        entry = await _setup_entry(hass)
+        entry.runtime_data.entity._rendered = None
+
+        client = await hass_client_no_auth()
+        resp = await client.get(_bmp_url(entry.entry_id))
+
+        assert resp.status == 503
+
+    async def test_bmp_battery_params_update_sensor(
+        self, hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+    ) -> None:
+        # Battery query params are honoured on the BMP endpoint.
+        entry = await _setup_entry(hass)
+        _seed_rendered(entry.runtime_data.entity, _real_png())
+        sensor = MagicMock()
+        entry.runtime_data.battery_sensor = sensor
+
+        client = await hass_client_no_auth()
+        await client.get(
+            _bmp_url(entry.entry_id),
+            params={"batteryLevel": "42", "isCharging": "1"},
+        )
+
+        sensor.update_battery.assert_called_once_with(42, True)
 
 
 class TestEinkLayoutView:

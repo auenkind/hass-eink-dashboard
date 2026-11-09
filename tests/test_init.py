@@ -44,6 +44,7 @@ from custom_components.eink_dashboard.battery import resolve_battery_level
 from custom_components.eink_dashboard.const import DOMAIN, NumberFormat
 from custom_components.eink_dashboard.http import (
     EinkLayoutView,
+    EinkPublicBmpImageView,
     EinkPublicImageView,
 )
 
@@ -86,7 +87,7 @@ def mock_store_class():
 
 class TestAsyncSetup:
     async def test_registers_http_views(self, hass: HomeAssistant) -> None:
-        # async_setup registers both HTTP view classes exactly once each.
+        # async_setup registers each HTTP view class exactly once.
         await _setup_http(hass)
 
         with patch.object(
@@ -94,11 +95,12 @@ class TestAsyncSetup:
         ) as mock_register_view:
             await async_setup(hass, {})
 
-        assert mock_register_view.call_count == 2
+        assert mock_register_view.call_count == 3
         view_types = {
             type(call.args[0]) for call in mock_register_view.call_args_list
         }
         assert EinkPublicImageView in view_types
+        assert EinkPublicBmpImageView in view_types
         assert EinkLayoutView in view_types
 
     async def test_registers_static_path(self, hass: HomeAssistant) -> None:

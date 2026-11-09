@@ -54,6 +54,7 @@ from . import (
     _ha_time_zone,
     build_display_config,
 )
+from .bmp import BmpDepth, png_to_bmp
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
@@ -118,6 +119,8 @@ class EinkDashboardImage(ImageEntity):
         self._widgets: list[dict[str, Any]] = []
         self._rendered: bytes | None = None
         self._etag: str | None = None
+        # Converted BMPs keyed by (PNG ETag, depth); reset on re-render.
+        self._bmp_cache: dict[tuple[str, BmpDepth], bytes] = {}
         self._unsub: Callable[[], None] | None = None
         self._refresh_lock = asyncio.Lock()
         self._last_push: float | None = None
@@ -436,3 +439,34 @@ class EinkDashboardImage(ImageEntity):
     async def async_image(self) -> bytes | None:
         """Return the latest rendered PNG bytes."""
         return self._rendered
+
+    async def async_image_bmp(
+        self, depth: BmpDepth = BmpDepth.AUTO
+    ) -> bytes | None:
+        """Return the latest rendered image converted to BMP.
+
+        The conversion runs in the executor once per rendered image
+        and depth; later polls are served from a cache that is dropped
+        as soon as a new image has been rendered.
+
+        Args:
+            depth: Requested BMP bit depth.
+
+        Returns:
+            BMP bytes, or None if no image has been rendered yet.
+        """
+        png = self._rendered
+        etag = self._etag
+        if png is None or etag is None:
+            return None
+        key = (etag, depth)
+        cached = self._bmp_cache.get(key)
+        if cached is not None:
+            return cached
+        bmp = await self.hass.async_add_executor_job(png_to_bmp, png, depth)
+        # Keep only entries for the current image.
+        self._bmp_cache = {
+            k: v for k, v in self._bmp_cache.items() if k[0] == etag
+        }
+        self._bmp_cache[key] = bmp
+        return bmp
