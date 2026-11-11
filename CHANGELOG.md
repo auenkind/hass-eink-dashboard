@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-11
+
+### Added
+
+- **Week Calendar widget** showing a week of calendar events, with an
+  agenda layout for short widgets and a "+N" marker for hidden
+  all-day events.
+- **BMP endpoint**: the dashboard image is also served as BMP for
+  microcontrollers.
+- **Graph widget**: the title can differ from the first series name.
+
+### Fixed
+
+- Visibility conditions of type `state` and `numeric_state` accept
+  the `entity_id` key.
+
 ## [0.9.0] - 2026-10-29
 
 ### Added
@@ -358,6 +374,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release.
 
+[0.9.1]: https://github.com/auenkind/hass-eink-dashboard/releases/tag/v0.9.1
 [0.9.0]: https://github.com/cryptomilk/hass-eink-dashboard/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/cryptomilk/hass-eink-dashboard/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/cryptomilk/hass-eink-dashboard/compare/v0.6.0...v0.7.0
